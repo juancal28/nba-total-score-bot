@@ -1,0 +1,52 @@
+# Default configuration. Override with config/local.toml or NPB_* env vars.
+
+[wallet]
+# Polygon chain id.
+chain_id = 137
+
+[polymarket]
+# CLOB endpoints. SDK uses the REST URL; WS handled internally.
+clob_rest = "https://clob.polymarket.com"
+# Polymarket CTF Exchange on Polygon (verified 2026-05-28 against docs.polymarket.com/resources/contracts).
+exchange_address = "0xE111180000d2663C0091e4f400237545B87B996B"
+# Polymarket collateral token (pUSD wrapper).
+collateral_address = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+# Conditional Tokens framework on Polygon.
+ctf_address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+# Neg-risk Exchange variant (used for certain markets).
+neg_risk_exchange_address = "0xe2222d279d744050d28e00520010520000310F59"
+
+[sportradar]
+# Trial REST endpoint base. Production is api.sportradar.com/nba/production/...
+base_url = "https://api.sportradar.com/nba/trial/v8/en"
+# Poll interval for the trial REST play-by-play feed (ms).
+# 5000ms is the practical lower bound on the trial tier rate limit (1 QPS).
+poll_interval_ms = 5000
+
+[strategy]
+q2_window_minutes = 2
+lr_p_threshold = 0.05
+bootstrap_iters = 1000
+q1_scaling_factor = 0.97
+min_coverage_ratio = 0.95
+min_edge = 0.05
+max_q1_margin = 12
+max_book_age_ms = 500
+
+[execution]
+order_size_usdc = "10"
+max_slippage = "0.02"
+sign_max_book_age_ms = 250
+
+[exit]
+take_profit_prob = 0.98
+cut_loss_prob = 0.02
+poll_interval_ms = 1000
+
+[risk]
+max_position_usdc = "100"
+max_daily_loss_usdc = "50"
+max_consecutive_feed_gaps = 3
+
+[storage]
+db_path = "data/orders.redb"

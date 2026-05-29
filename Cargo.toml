@@ -1,0 +1,75 @@
+[package]
+name = "nba_poly_bot"
+version = "0.1.0"
+edition = "2024"
+description = "NBA Q1-signal trading bot for Polymarket game totals"
+
+[[bin]]
+name = "nba_poly_bot"
+path = "src/main.rs"
+
+[[bin]]
+name = "setup"
+path = "src/bin/setup.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+futures-util = "0.3"
+
+alloy = { version = "1", features = [
+    "signer-local",
+    "signers",
+    "sol-types",
+    "rpc-types-eth",
+    "providers",
+    "contract",
+    "network",
+    "transports",
+    "transport-http",
+    "reqwest",
+] }
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+url = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+
+# Official Polymarket Rust SDK — user-approved (handles wallet signing).
+polymarket_client_sdk_v2 = { version = "=0.6.0-canary.1", features = ["clob", "ws"] }
+
+hex = "0.4"
+rand = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+secrecy = { version = "0.10", features = ["serde"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+redb = "2"
+jiff = { version = "0.1", features = ["serde"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+approx = "0.5"
+proptest = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+debug = false
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true

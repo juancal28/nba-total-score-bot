@@ -1,0 +1,10 @@
+/target
+/data
+*.redb
+*.redb.lock
+.env
+.env.*
+!.env.example
+config/local.toml
+*.log
+.DS_Store
