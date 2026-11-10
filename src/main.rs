@@ -31,6 +31,16 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// Watch a day's games and log the trades the bot would make. Needs no
+    /// wallet and submits nothing.
+    Paper {
+        /// Game date (US Eastern), YYYY-MM-DD. Defaults to today.
+        #[arg(long)]
+        date: Option<String>,
+        /// Only these SportRadar game ids (comma-separated). Default: all.
+        #[arg(long, value_delimiter = ',')]
+        games: Vec<String>,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -56,6 +66,9 @@ async fn main() -> Result<()> {
                 dry_run,
             })
             .await
+        }
+        Cmd::Paper { date, games } => {
+            nba_poly_bot::paper::run(nba_poly_bot::paper::PaperArgs { date, games }).await
         }
     }
 }

@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod executor;
 pub mod feed;
+pub mod paper;
 pub mod polymarket;
 pub mod risk;
 pub mod strategy;

@@ -229,3 +229,22 @@ mod tests {
         assert!(parse_book("21", body.as_bytes()).is_err());
     }
 }
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// Hits the real Polymarket APIs. Run with
+    /// `NPB_LIVE_SLUG=nba-mil-nyk-2026-11-10 cargo test -- --ignored live_market`.
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn live_market_and_book_parse() {
+        let slug = std::env::var("NPB_LIVE_SLUG").expect("set NPB_LIVE_SLUG to an open game's slug");
+        let http = reqwest::Client::new();
+        let market = fetch_main_totals_market(&http, &slug).await.unwrap().expect("totals market");
+        let book = fetch_book(&http, &market.over_token_id).await.unwrap();
+        let (bid, ask) = (book.best_bid().unwrap().price, book.best_ask().unwrap().price);
+        println!("{} line {} bid {bid} ask {ask}", market.question, market.line);
+        assert!(bid < ask);
+    }
+}
