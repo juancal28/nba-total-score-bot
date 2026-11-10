@@ -8,3 +8,7 @@
 config/local.toml
 *.log
 .DS_Store
+
+# Editor backup / undo files (may contain copies of .env)
+*~
+*.un~
