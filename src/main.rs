@@ -57,6 +57,34 @@ enum Cmd {
     },
     /// Replay the cached games for every sizing variant and write a report.
     BacktestRun,
+    /// Show paper-trading decisions and backtest results. With no
+    /// subcommand: tonight's paper trades plus the latest backtest headline.
+    Status {
+        #[command(subcommand)]
+        view: Option<StatusCmd>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum StatusCmd {
+    /// Paper-trading decisions, graded once their markets settle.
+    Paper {
+        /// Game date (US Eastern), YYYY-MM-DD. Defaults to today.
+        #[arg(long, conflicts_with = "all")]
+        date: Option<String>,
+        /// Every recorded decision, all dates.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    /// A backtest report (the latest by default).
+    Backtest {
+        /// List saved reports instead of printing one.
+        #[arg(long, default_value_t = false)]
+        list: bool,
+        /// Name of the report to print, as shown by --list.
+        #[arg(long)]
+        report: Option<String>,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -96,6 +124,15 @@ async fn main() -> Result<()> {
             let dir = nba_poly_bot::backtest::run::run()?;
             tracing::info!(dir = %dir.display(), "report written");
             Ok(())
+        }
+        Cmd::Status { view } => {
+            use nba_poly_bot::status::StatusView;
+            let view = match view {
+                None => StatusView::Overview,
+                Some(StatusCmd::Paper { date, all }) => StatusView::Paper { date, all },
+                Some(StatusCmd::Backtest { list, report }) => StatusView::Backtest { list, report },
+            };
+            nba_poly_bot::status::run(view).await
         }
         Cmd::Paper { date, games } => {
             nba_poly_bot::paper::run(nba_poly_bot::paper::PaperArgs { date, games }).await

@@ -30,7 +30,7 @@ use crate::polymarket::public::{TotalsMarket, event_slug, fetch_book, fetch_main
 use crate::strategy::sizing::SizingParams;
 use crate::strategy::{BuyOutcome, Evaluation, Phase, StrategyEngine};
 
-const DECISIONS_PATH: &str = "data/paper/decisions.jsonl";
+pub const DECISIONS_PATH: &str = "data/paper/decisions.jsonl";
 /// Minimum spacing between SportRadar requests (trial limit is 1 per second).
 const SR_SPACING: Duration = Duration::from_millis(1100);
 /// First poll this long after the scheduled start; tipoff runs late.

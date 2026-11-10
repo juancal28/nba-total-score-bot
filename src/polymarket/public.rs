@@ -43,14 +43,36 @@ pub fn event_slug(away_alias: &str, home_alias: &str, scheduled: Timestamp) -> S
 /// From a Gamma `/events?slug=` response, pick the full-game totals market
 /// with the highest volume. `None` if the event or a totals market is missing.
 pub fn main_totals_market(gamma_events_json: &[u8]) -> Result<Option<TotalsMarket>> {
+    pick_totals_market(gamma_events_json, |markets| {
+        markets.into_iter().max_by(|a, b| a.volume().total_cmp(&b.volume()))
+    })
+}
+
+/// The full-game totals market whose OVER token is `over_token_id`. Used to
+/// grade a past decision against the exact line it traded, which may no
+/// longer be the highest-volume one.
+pub fn totals_market_for_token(
+    gamma_events_json: &[u8],
+    over_token_id: &str,
+) -> Result<Option<TotalsMarket>> {
+    let needle = format!("[\"{over_token_id}\"");
+    pick_totals_market(gamma_events_json, |markets| {
+        markets.into_iter().find(|m| m.clob_token_ids.starts_with(&needle))
+    })
+}
+
+fn pick_totals_market(
+    gamma_events_json: &[u8],
+    pick: impl FnOnce(Vec<GammaMarket>) -> Option<GammaMarket>,
+) -> Result<Option<TotalsMarket>> {
     let events: Vec<GammaEvent> = serde_json::from_slice(gamma_events_json)?;
     let Some(event) = events.into_iter().next() else { return Ok(None) };
-    let main = event
+    let totals: Vec<GammaMarket> = event
         .markets
         .into_iter()
         .filter(|m| m.sports_market_type.as_deref() == Some("totals") && m.line.is_some())
-        .max_by(|a, b| a.volume().total_cmp(&b.volume()));
-    let Some(m) = main else { return Ok(None) };
+        .collect();
+    let Some(m) = pick(totals) else { return Ok(None) };
 
     let tokens: Vec<String> =
         serde_json::from_str(&m.clob_token_ids).context("clobTokenIds is not a JSON array")?;
@@ -283,6 +305,15 @@ mod tests {
         assert_eq!(m.slug, "nba-mil-nyk-2026-11-10");
         assert_eq!(m.taker_base_fee, Some(1000.0));
         assert!(m.fees_enabled);
+    }
+
+    #[test]
+    fn market_can_be_looked_up_by_its_over_token() {
+        // "11" is the lower-volume 220.5 line; "1" must not prefix-match it.
+        let m = totals_market_for_token(EVENTS.as_bytes(), "11").unwrap().unwrap();
+        assert_eq!(m.line, Decimal::from_str("220.5").unwrap());
+        assert_eq!(totals_market_for_token(EVENTS.as_bytes(), "1").unwrap(), None);
+        assert_eq!(totals_market_for_token(EVENTS.as_bytes(), "31").unwrap(), None);
     }
 
     #[test]

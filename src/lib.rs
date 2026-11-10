@@ -7,6 +7,7 @@ pub mod feed;
 pub mod paper;
 pub mod polymarket;
 pub mod risk;
+pub mod status;
 pub mod strategy;
 
 use std::sync::Arc;
