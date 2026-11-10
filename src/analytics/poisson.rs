@@ -86,13 +86,13 @@ pub fn bootstrap_projected_total(
     scaling: f64,
     iters: usize,
     alpha: f64,
+    rng: &mut impl Rng,
 ) -> (f64, f64, f64) {
     if per_minute.is_empty() {
         let point = current_score as f64;
         return (point, point, point);
     }
 
-    let mut rng = rand::thread_rng();
     let mut samples: Vec<f64> = Vec::with_capacity(iters);
     let n = per_minute.len();
 
@@ -196,7 +196,7 @@ mod tests {
     fn bootstrap_interval_contains_point_estimate() {
         let q1 = vec![2u32, 3, 1, 4, 0, 2, 3, 1, 2, 0, 3, 2];
         let (lo, point, hi) =
-            bootstrap_projected_total(&q1, 23, 36.0, 0.97, 1000, 0.05);
+            bootstrap_projected_total(&q1, 23, 36.0, 0.97, 1000, 0.05, &mut rand::thread_rng());
         assert!(lo <= point && point <= hi);
         assert!(point > 23.0);
     }

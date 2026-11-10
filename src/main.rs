@@ -41,6 +41,22 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         games: Vec<String>,
     },
+    /// Download and cache the data the backtest replays.
+    BacktestFetch {
+        /// Games to sample from last season.
+        #[arg(long, default_value_t = 500)]
+        last_season_games: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Re-download the current-season schedule to pick up new games.
+        #[arg(long, default_value_t = false)]
+        refresh_current: bool,
+        /// Stop after this many SportRadar requests in this run.
+        #[arg(long, default_value_t = 720)]
+        max_requests: u32,
+    },
+    /// Replay the cached games for every sizing variant and write a report.
+    BacktestRun,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -66,6 +82,20 @@ async fn main() -> Result<()> {
                 dry_run,
             })
             .await
+        }
+        Cmd::BacktestFetch { last_season_games, seed, refresh_current, max_requests } => {
+            nba_poly_bot::backtest::fetch::run(nba_poly_bot::backtest::fetch::FetchArgs {
+                last_season_games,
+                seed,
+                refresh_current,
+                max_requests,
+            })
+            .await
+        }
+        Cmd::BacktestRun => {
+            let dir = nba_poly_bot::backtest::run::run()?;
+            tracing::info!(dir = %dir.display(), "report written");
+            Ok(())
         }
         Cmd::Paper { date, games } => {
             nba_poly_bot::paper::run(nba_poly_bot::paper::PaperArgs { date, games }).await

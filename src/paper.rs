@@ -215,7 +215,7 @@ pub fn next_poll_delay(period: u8, game_clock_seconds: u32, q2_window_minutes: u
 }
 
 /// Rate-limited SportRadar client that counts its requests.
-struct SportRadar {
+pub(crate) struct SportRadar {
     http: reqwest::Client,
     base_url: String,
     api_key: SecretString,
@@ -224,7 +224,15 @@ struct SportRadar {
 }
 
 impl SportRadar {
-    async fn get(&self, path: &str) -> Result<Vec<u8>> {
+    pub(crate) fn new(http: reqwest::Client, base_url: String, api_key: SecretString) -> Self {
+        Self { http, base_url, api_key, next_slot: Mutex::new(Instant::now()), requests: AtomicU32::new(0) }
+    }
+
+    pub(crate) fn requests(&self) -> u32 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn get(&self, path: &str) -> Result<Vec<u8>> {
         {
             let mut slot = self.next_slot.lock().await;
             sleep_until(*slot).await;
@@ -250,13 +258,7 @@ pub async fn run(args: PaperArgs) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("NPB_SPORTRADAR__API_KEY is not set"))?;
     let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
-    let sr = Arc::new(SportRadar {
-        http: http.clone(),
-        base_url: cfg.sportradar.base_url.clone(),
-        api_key,
-        next_slot: Mutex::new(Instant::now()),
-        requests: AtomicU32::new(0),
-    });
+    let sr = Arc::new(SportRadar::new(http.clone(), cfg.sportradar.base_url.clone(), api_key));
 
     let date = match args.date {
         Some(d) => d,
@@ -420,6 +422,8 @@ mod tests {
             volume: 1000.0,
             taker_base_fee: Some(1000.0),
             fees_enabled: true,
+            closed: false,
+            over_won: None,
         }
     }
 

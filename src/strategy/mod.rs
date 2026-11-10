@@ -3,6 +3,8 @@ pub mod sizing;
 
 use std::sync::Arc;
 
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
@@ -66,6 +68,9 @@ pub struct StrategyEngine {
     pub coverage: CoverageTracker,
     pub q1_home: u32,
     pub q1_away: u32,
+    /// Seed for the bootstrap RNG. `None` (live) draws from OS entropy;
+    /// the backtest sets it so reruns reproduce the same numbers.
+    pub bootstrap_seed: Option<u64>,
 }
 
 impl StrategyEngine {
@@ -81,6 +86,7 @@ impl StrategyEngine {
             coverage: CoverageTracker::new(12),
             q1_home: 0,
             q1_away: 0,
+            bootstrap_seed: None,
         }
     }
 
@@ -207,6 +213,10 @@ impl StrategyEngine {
             + self.q2_per_minute.iter().sum::<u32>();
         let consumed = 12.0 + self.cfg.q2_window_minutes as f64;
         let remaining = GAME_MINUTES - consumed;
+        let mut rng = match self.bootstrap_seed {
+            Some(seed) => StdRng::seed_from_u64(seed),
+            None => StdRng::from_entropy(),
+        };
         let (lo, _point, hi) = bootstrap_projected_total(
             &self.q1_per_minute,
             current_score,
@@ -214,6 +224,7 @@ impl StrategyEngine {
             self.cfg.q1_scaling_factor,
             self.cfg.bootstrap_iters,
             0.05,
+            &mut rng,
         );
         let projection = Projection::build(
             &q1_fit,

@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod backtest;
 pub mod config;
 pub mod error;
 pub mod executor;

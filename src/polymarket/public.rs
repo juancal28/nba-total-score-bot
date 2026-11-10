@@ -25,6 +25,9 @@ pub struct TotalsMarket {
     pub volume: f64,
     pub taker_base_fee: Option<f64>,
     pub fees_enabled: bool,
+    pub closed: bool,
+    /// How the market resolved; `None` while open or if it resolved 50-50.
+    pub over_won: Option<bool>,
 }
 
 /// Polymarket's event slug for an NBA game: `nba-{away}-{home}-{date}`, with
@@ -54,6 +57,17 @@ pub fn main_totals_market(gamma_events_json: &[u8]) -> Result<Option<TotalsMarke
     let [over, under] = <[String; 2]>::try_from(tokens)
         .map_err(|t| anyhow!("expected 2 outcome tokens, got {}", t.len()))?;
     let line = m.line.unwrap_or_default();
+    // Resolved markets report outcome prices of exactly "1" and "0".
+    let over_won = m
+        .outcome_prices
+        .as_deref()
+        .filter(|_| m.closed)
+        .and_then(|p| serde_json::from_str::<Vec<String>>(p).ok())
+        .and_then(|p| match p.first().map(String::as_str) {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            _ => None,
+        });
     Ok(Some(TotalsMarket {
         slug: event.slug,
         volume: m.volume(),
@@ -63,6 +77,8 @@ pub fn main_totals_market(gamma_events_json: &[u8]) -> Result<Option<TotalsMarke
         under_token_id: under,
         taker_base_fee: m.taker_base_fee,
         fees_enabled: m.fees_enabled,
+        closed: m.closed,
+        over_won,
     }))
 }
 
@@ -117,6 +133,11 @@ struct GammaMarket {
     taker_base_fee: Option<f64>,
     #[serde(default)]
     fees_enabled: bool,
+    #[serde(default)]
+    closed: bool,
+    /// JSON-encoded array of final prices, e.g. `["0", "1"]`.
+    #[serde(default)]
+    outcome_prices: Option<String>,
 }
 
 impl GammaMarket {
@@ -154,6 +175,66 @@ pub async fn fetch_main_totals_market(
         .bytes()
         .await?;
     main_totals_market(&body)
+}
+
+/// One point of a token's price history: unix seconds and price.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct PricePoint {
+    pub t: i64,
+    pub p: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PriceHistory {
+    #[serde(default)]
+    history: Vec<PricePoint>,
+}
+
+/// Parse a CLOB `/prices-history` response, sorted by time.
+pub fn parse_price_history(body: &[u8]) -> Result<Vec<PricePoint>> {
+    let mut history = serde_json::from_slice::<PriceHistory>(body)?.history;
+    history.sort_by_key(|p| p.t);
+    Ok(history)
+}
+
+/// Latest price at or before `t`, if one exists within `max_age_secs`.
+pub fn price_at(history: &[PricePoint], t: i64, max_age_secs: i64) -> Option<f64> {
+    let idx = history.partition_point(|p| p.t <= t);
+    let point = history.get(idx.checked_sub(1)?)?;
+    (t - point.t <= max_age_secs).then_some(point.p)
+}
+
+/// Raw one-minute price history for `token_id` between two unix times.
+/// (`interval=max` returns nothing for older markets; always pass a range.)
+pub async fn fetch_price_history_raw(
+    http: &reqwest::Client,
+    token_id: &str,
+    start_ts: i64,
+    end_ts: i64,
+) -> Result<Vec<u8>> {
+    let resp = http
+        .get(format!("{CLOB_BASE}/prices-history"))
+        .query(&[
+            ("market", token_id.to_string()),
+            ("startTs", start_ts.to_string()),
+            ("endTs", end_ts.to_string()),
+            ("fidelity", "1".to_string()),
+        ])
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(resp.bytes().await?.to_vec())
+}
+
+/// Raw Gamma `/events?slug=` response body.
+pub async fn fetch_event_raw(http: &reqwest::Client, slug: &str) -> Result<Vec<u8>> {
+    let resp = http
+        .get(format!("{GAMMA_BASE}/events"))
+        .query(&[("slug", slug)])
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(resp.bytes().await?.to_vec())
 }
 
 pub async fn fetch_book(http: &reqwest::Client, token_id: &str) -> Result<OrderBookSnapshot> {
@@ -221,6 +302,27 @@ mod tests {
         assert_eq!(prices(&b.bids), ["0.48", "0.47", "0.01"]);
         assert_eq!(prices(&b.asks), ["0.49", "0.5", "0.99"]);
         assert_eq!(b.asks[0].size, Decimal::from(10));
+    }
+
+    #[test]
+    fn resolved_market_reports_the_winner() {
+        let body = r#"[{"slug": "s", "markets": [{"sportsMarketType": "totals", "line": 213.5, "volume": "9",
+            "clobTokenIds": "[\"1\", \"2\"]", "closed": true, "outcomePrices": "[\"0\", \"1\"]"}]}]"#;
+        let m = main_totals_market(body.as_bytes()).unwrap().unwrap();
+        assert!(m.closed);
+        assert_eq!(m.over_won, Some(false));
+        // The open market in EVENTS has no winner yet.
+        assert_eq!(main_totals_market(EVENTS.as_bytes()).unwrap().unwrap().over_won, None);
+    }
+
+    #[test]
+    fn price_at_takes_the_latest_point_not_after_t() {
+        let h = parse_price_history(br#"{"history":[{"t":160,"p":0.6},{"t":100,"p":0.5}]}"#).unwrap();
+        assert_eq!(price_at(&h, 99, 300), None);
+        assert_eq!(price_at(&h, 100, 300), Some(0.5));
+        assert_eq!(price_at(&h, 159, 300), Some(0.5));
+        assert_eq!(price_at(&h, 400, 300), Some(0.6));
+        assert_eq!(price_at(&h, 461, 300), None);
     }
 
     #[test]
