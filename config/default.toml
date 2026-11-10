@@ -34,9 +34,20 @@ max_q1_margin = 12
 max_book_age_ms = 500
 
 [execution]
-order_size_usdc = "10"
 max_slippage = "0.02"
 sign_max_book_age_ms = 250
+
+[sizing]
+# Capital the Kelly stake is a fraction of. Set to what you are willing to
+# put at risk across trades; the bot does not read the wallet balance.
+bankroll_usdc = "500"
+# Multiplier on full Kelly. 0.25 = quarter Kelly.
+kelly_fraction = 0.25
+# Bootstrap 95% CI width (points) at or below which no uncertainty haircut
+# applies; wider CIs scale the stake by ci_ref_width / width. Uncalibrated.
+ci_ref_width = 60.0
+# Orders smaller than this are skipped rather than submitted.
+min_order_usdc = "1"
 
 [exit]
 take_profit_prob = 0.98

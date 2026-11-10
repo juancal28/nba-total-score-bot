@@ -1,4 +1,5 @@
 pub mod edge;
+pub mod sizing;
 
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use crate::feed::{GameEvent, Team};
 use crate::feed::coverage::CoverageTracker;
 use crate::polymarket::book::OrderBookSnapshot;
 use crate::strategy::edge::{EdgeDecision, evaluate_edge};
+use crate::strategy::sizing::SizingParams;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -40,6 +42,7 @@ pub enum BuyOutcome {
 
 pub struct StrategyEngine {
     pub cfg: StrategyConfig,
+    pub sizing: SizingParams,
     pub line: Decimal,
     pub phase: Phase,
     pub q1_per_minute: Vec<u32>,
@@ -50,10 +53,11 @@ pub struct StrategyEngine {
 }
 
 impl StrategyEngine {
-    pub fn new(cfg: StrategyConfig, line: Decimal) -> Self {
+    pub fn new(cfg: StrategyConfig, sizing: SizingParams, line: Decimal) -> Self {
         let q2_window = cfg.q2_window_minutes as usize;
         Self {
             cfg,
+            sizing,
             line,
             phase: Phase::PreGame,
             q1_per_minute: vec![0; 12],
@@ -201,7 +205,14 @@ impl StrategyEngine {
         let line_f = self.line.to_string().parse::<f64>().unwrap_or(0.0);
         let p_over = projection.p_over(line_f);
 
-        match evaluate_edge(&book, p_over, self.cfg.min_edge, self.cfg.max_book_age_ms) {
+        match evaluate_edge(
+            &book,
+            p_over,
+            projection.ci_high - projection.ci_low,
+            self.cfg.min_edge,
+            self.cfg.max_book_age_ms,
+            &self.sizing,
+        ) {
             EdgeDecision::Trade(intent) => Some(intent),
             EdgeDecision::Skip(reason) => {
                 warn!(reason, "skipping trade");

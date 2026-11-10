@@ -17,8 +17,18 @@ Mechanics:
 3. At the configured Q2 window (default 2 minutes), fit a second `lambda` from the Q2 sample.
 4. Run a two-sample likelihood-ratio test. Skip the trade if the p-value is below `lr_p_threshold`.
 5. Bootstrap (1000 resamples) a 95% CI for the projected full-game total, applying a Q1→game scaling factor (`q1_scaling_factor`, default 0.97) to correct for Q1 being the league's highest-scoring quarter on average.
-6. Compute `P(total > line)` from the projected total + CI, and the implied market probability from the OVER token's best ask. If the edge meets `min_edge` and the book passes a staleness check, build a FOK market order via the SDK, sign it with the wallet, and submit.
+6. Compute `P(total > line)` from the projected total + CI, and the implied market probability from the OVER token's best ask. If the edge meets `min_edge` and the book passes a staleness check, size the order with fractional Kelly (below), build a FOK market order via the SDK, sign it with the wallet, and submit.
 7. Once filled, hold the position. Watch the order-book mid for an implied resolution probability ≥ 98% (take profit) or ≤ 2% (cut loss). Otherwise hold to UMA resolution.
+
+### Position sizing
+
+Each trade is sized with the Kelly criterion (`src/strategy/sizing.rs`). A share bought at price `c` that pays $1 with model probability `q` has full-Kelly stake `(q − c) / (1 − c)` of the bankroll. Three adjustments:
+
+- **Book depth.** Larger orders walk up the ask ladder, so each extra share costs more. The sizer solves the expected-log-wealth optimum level by level and stops at the first level where another share would lower it, so it never buys into a price that erases its own edge. UNDER buys walk the OVER bids (an UNDER at `1 − b` matches an OVER bid at `b`).
+- **Fractional Kelly.** The full-Kelly stake is multiplied by `kelly_fraction`, because `q` is an estimate and full Kelly over-bets when the estimate is too confident.
+- **Model uncertainty.** When the bootstrap CI for the projected total is wider than `ci_ref_width`, the stake is scaled down by `ci_ref_width / width`.
+
+The result is capped at `risk.max_position_usdc`, and orders below `min_order_usdc` are skipped.
 
 ### What this does *not* model
 
@@ -85,8 +95,11 @@ The bot reads `.env` automatically. **Do not commit it** — `.gitignore` alread
 | `strategy` | `min_edge` | 0.05 | Required probability-edge over market implied prob |
 | `strategy` | `max_q1_margin` | 12 | Skip if Q1 ends with score margin > this (blowout filter) |
 | `strategy` | `max_book_age_ms` | 500 | Reject decision if book older than this |
-| `execution` | `order_size_usdc` | "10" | USDC amount per trade |
 | `execution` | `max_slippage` | "0.02" | Acceptable VWAP slippage from top-of-book |
+| `sizing` | `bankroll_usdc` | "500" | Capital the Kelly stake is a fraction of |
+| `sizing` | `kelly_fraction` | 0.25 | Multiplier on full Kelly (0.25 = quarter Kelly) |
+| `sizing` | `ci_ref_width` | 60.0 | CI width (points) above which the stake is scaled by `ci_ref_width / width` |
+| `sizing` | `min_order_usdc` | "1" | Skip orders smaller than this |
 | `exit` | `take_profit_prob` | 0.98 | Close position if implied resolution prob ≥ this |
 | `exit` | `cut_loss_prob` | 0.02 | Close position if implied resolution prob ≤ this |
 | `risk` | `max_position_usdc` | "100" | Hard cap on open position size |
@@ -101,8 +114,8 @@ Override any key locally without editing the committed defaults:
 [strategy]
 min_edge = 0.08
 
-[execution]
-order_size_usdc = "25"
+[sizing]
+kelly_fraction = 0.5
 ```
 
 Or via env var (note the `__` separator):

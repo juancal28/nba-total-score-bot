@@ -15,6 +15,7 @@ pub struct Config {
     pub sportradar: SportRadarConfig,
     pub strategy: StrategyConfig,
     pub execution: ExecutionConfig,
+    pub sizing: SizingConfig,
     pub exit: ExitConfig,
     pub risk: RiskConfig,
     pub storage: StorageConfig,
@@ -59,10 +60,18 @@ pub struct StrategyConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExecutionConfig {
     #[serde(with = "rust_decimal::serde::str")]
-    pub order_size_usdc: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
     pub max_slippage: Decimal,
     pub sign_max_book_age_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SizingConfig {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub bankroll_usdc: Decimal,
+    pub kelly_fraction: f64,
+    pub ci_ref_width: f64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub min_order_usdc: Decimal,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -94,5 +103,17 @@ impl Config {
             .merge(Env::prefixed("NPB_").split("__"))
             .extract()?;
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_toml_parses() {
+        let cfg: Config = Figment::new().merge(Toml::file("config/default.toml")).extract().unwrap();
+        assert_eq!(cfg.sizing.kelly_fraction, 0.25);
+        assert_eq!(cfg.sizing.bankroll_usdc, Decimal::from(500));
     }
 }

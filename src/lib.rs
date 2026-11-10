@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use secrecy::ExposeSecret;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -20,6 +21,7 @@ use crate::feed::sportradar::SportRadarPoller;
 use crate::polymarket::client::PolymarketClient;
 use crate::polymarket::marketdata::MarketDataClient;
 use crate::strategy::StrategyEngine;
+use crate::strategy::sizing::SizingParams;
 
 pub struct RunArgs {
     pub game_id: String,
@@ -32,7 +34,7 @@ pub struct RunArgs {
 /// Run the bot against a single live game.
 pub async fn run(args: RunArgs) -> Result<()> {
     let cfg = config::Config::load()?;
-    info!(?cfg.strategy, ?cfg.execution, ?cfg.exit, ?cfg.risk, "config loaded");
+    info!(?cfg.strategy, ?cfg.execution, ?cfg.sizing, ?cfg.exit, ?cfg.risk, "config loaded");
 
     let pk = cfg
         .wallet
@@ -75,7 +77,14 @@ pub async fn run(args: RunArgs) -> Result<()> {
         }
     });
 
-    let strategy = StrategyEngine::new(cfg.strategy.clone(), args.line);
+    let sizing = SizingParams {
+        bankroll_usdc: cfg.sizing.bankroll_usdc.to_f64().unwrap_or(0.0),
+        kelly_fraction: cfg.sizing.kelly_fraction,
+        ci_ref_width: cfg.sizing.ci_ref_width,
+        min_order_usdc: cfg.sizing.min_order_usdc.to_f64().unwrap_or(0.0),
+        max_order_usdc: cfg.risk.max_position_usdc.to_f64().unwrap_or(0.0),
+    };
+    let strategy = StrategyEngine::new(cfg.strategy.clone(), sizing, args.line);
     let intent = strategy.run(feed_rx, book_rx.clone()).await;
 
     let Some(intent) = intent else {
