@@ -162,8 +162,9 @@ pub fn render_record(decisions: &[GradedDecision]) -> String {
         settled.len(),
         wins,
         settled.len() - wins,
-        settled.iter().sum::<f64>(),
-        staked,
+        // `+ 0.0` turns the empty sum's negative zero into plain zero.
+        settled.iter().sum::<f64>() + 0.0,
+        staked + 0.0,
         trades - settled.len()
     )
 }
@@ -308,6 +309,12 @@ mod tests {
         assert!(out.ends_with(
             "3 games decided, 2 trades, 1 settled (1 won, 0 lost), P&L +20.00 on $20.00 staked, 1 pending"
         ));
+    }
+
+    #[test]
+    fn record_with_nothing_settled_shows_plain_zeros() {
+        let line = render_record(&[GradedDecision { record: record(true), over_won: None }]);
+        assert!(line.ends_with("P&L +0.00 on $0.00 staked, 1 pending"), "{line}");
     }
 
     #[test]

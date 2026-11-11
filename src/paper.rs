@@ -172,6 +172,8 @@ pub fn decide(
 ) -> DecisionRecord {
     engine.line = market.line;
     let mut record = record.with_market(market).with_engine(engine);
+    // The record was created when the game started being watched.
+    record.decided_at = Timestamp::now();
     record.best_bid = book.best_bid().map(|l| l.price.to_string());
     record.best_ask = book.best_ask().map(|l| l.price.to_string());
 
@@ -493,11 +495,15 @@ mod tests {
         // Q1 pace (57 in 12 min) projects far below a 224.5 line, and the
         // market still prices OVER at 0.90, so UNDER at 0.10 is a clear buy.
         let mut engine = engine_at_decision();
-        let r = decide(DecisionRecord::new(&game(), "slug"), &mut engine, &market(), book("0.90", "0.91"));
+        let mut stale = DecisionRecord::new(&game(), "slug");
+        stale.decided_at = stale.scheduled;
+        let r = decide(stale, &mut engine, &market(), book("0.90", "0.91"));
         assert!(r.traded, "skip_reason: {:?}", r.skip_reason);
         assert_eq!(r.side.as_deref(), Some("under"));
         assert!(Decimal::from_str(r.size_usdc.as_deref().unwrap()).unwrap() >= Decimal::ONE);
         assert_eq!(r.line.as_deref(), Some("224.5"));
+        // Stamped when decided, not when the 2025 fixture game was scheduled.
+        assert!(r.decided_at > r.scheduled + SignedDuration::from_hours(24));
         assert_eq!(r.best_ask.as_deref(), Some("0.91"));
         assert_eq!(r.q1_per_minute.iter().sum::<u32>(), 57);
         assert!(r.p_over.unwrap() < 0.85);
