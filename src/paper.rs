@@ -336,12 +336,14 @@ async fn watch_game(
     let deadline = game.scheduled + GIVE_UP_AFTER;
 
     sleep(until(game.scheduled + FIRST_POLL_AFTER)).await;
+    // (period, clock) at the newest event seen so far, for pacing the next
+    // poll. Kept across polls: one that returns nothing new (a timeout, a
+    // quiet stretch) must not reset the pacing to "game not started".
+    let mut position = (0u8, 720u32);
     loop {
         if Timestamp::now() > deadline {
             return record.with_engine(&engine).skipped("game did not reach the decision point in time");
         }
-        // (period, clock) at the newest event, for pacing the next poll.
-        let mut position = (0u8, 720u32);
         match sr.get(&pbp_path).await.and_then(|body| parse_pbp(&body, &mut cursor)) {
             Ok(events) => {
                 for ev in &events {
