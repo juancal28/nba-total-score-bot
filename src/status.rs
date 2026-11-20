@@ -79,6 +79,41 @@ impl GradedDecision {
             (None, Some(_)) => None,
         }
     }
+
+    /// Profit or loss of the flat $10 comparison bet.
+    pub fn flat_pnl(&self) -> Option<f64> {
+        let r = &self.record;
+        bet_pnl(r.flat_side.as_deref(), r.flat_size_usdc.as_deref(), r.flat_vwap.as_deref(), self.over_won)
+    }
+
+    pub fn pace_flat_pnl(&self) -> Option<f64> {
+        let p = self.record.pace_only.as_ref()?;
+        bet_pnl(p.flat_side.as_deref(), p.flat_size_usdc.as_deref(), p.flat_vwap.as_deref(), self.over_won)
+    }
+
+    /// The decision sized flat $10, or `None` for records written before the
+    /// flat comparison existed (they carry neither a flat trade nor a reason).
+    fn flat_bet(&self) -> Option<Bet> {
+        let r = &self.record;
+        (r.flat_traded || r.flat_skip_reason.is_some()).then(|| Bet {
+            traded: r.flat_traded,
+            stake: r.flat_size_usdc.as_deref().and_then(|s| s.parse().ok()),
+            pnl: self.flat_pnl(),
+        })
+    }
+
+    /// The pure pace model sized flat $10; same fallbacks as `pace_bet`.
+    fn pace_flat_bet(&self) -> Option<Bet> {
+        match (&self.record.pace_only, &self.record.model) {
+            (Some(p), _) => (p.flat_traded || p.flat_skip_reason.is_some()).then(|| Bet {
+                traded: p.flat_traded,
+                stake: p.flat_size_usdc.as_deref().and_then(|s| s.parse().ok()),
+                pnl: self.pace_flat_pnl(),
+            }),
+            (None, None) => self.flat_bet(),
+            (None, Some(_)) => None,
+        }
+    }
 }
 
 pub fn eastern_date(t: Timestamp) -> String {
@@ -169,6 +204,10 @@ pub fn render_paper(decisions: &[GradedDecision]) -> String {
             let r = &d.record;
             let decision = describe(r.traded, &r.side, &r.size_usdc, &r.vwap, &r.skip_reason);
             let result = outcome(r.traded, d.over_won, d.pnl());
+            let flat = |b: Option<Bet>| match b {
+                Some(b) => outcome(b.traded, d.over_won, b.pnl),
+                None => "n/a".to_string(),
+            };
             let mut row = vec![
                 eastern_date(r.scheduled),
                 format!("{} @ {}", r.away, r.home),
@@ -178,6 +217,7 @@ pub fn render_paper(decisions: &[GradedDecision]) -> String {
                 format!("{} / {}", opt(&r.best_bid), opt(&r.best_ask)),
                 decision,
                 result,
+                flat(d.flat_bet()),
             ];
             if compare {
                 match &r.pace_only {
@@ -186,34 +226,49 @@ pub fn render_paper(decisions: &[GradedDecision]) -> String {
                         format!("{:.2}", p.p_over),
                         describe(p.traded, &p.side, &p.size_usdc, &p.vwap, &p.skip_reason),
                         outcome(p.traded, d.over_won, d.pace_only_pnl()),
+                        flat(d.pace_flat_bet()),
                     ]),
                     // A record from before the blend: the decision was pace-only.
-                    None => row.extend(["(same)", "(same)", "(same)", "(same)"].map(String::from)),
+                    None => row.extend(["(same)", "(same)", "(same)", "(same)", "(same)"].map(String::from)),
                 }
             }
             row
         })
         .collect();
-    let mut headers = vec!["Date", "Game", "Line", "Projection", "P(over)", "Bid / Ask", "Decision", "Result"];
+    let mut headers =
+        vec!["Date", "Game", "Line", "Projection", "P(over)", "Bid / Ask", "Kelly decision", "Kelly result", "Flat $10"];
     if compare {
-        headers.extend(["Pace proj.", "Pace P(over)", "Pace-only decision", "Pace-only result"]);
+        headers.extend(["Pace proj.", "Pace P(over)", "Pace-only Kelly", "Pace Kelly result", "Pace flat $10"]);
     }
     let mut out = table(&headers, &rows);
     let _ = write!(out, "\n\n{}", render_record(decisions));
     out
 }
 
-/// Running record over the given decisions. One line while only one model
-/// has decided games; one line per model once the blended model has records,
-/// so the two can be compared on the games each of them saw.
+/// Running record over the given decisions, one line per model and sizing.
+/// The blended lines appear once the blended model has records; flat lines
+/// cover only games that recorded a flat comparison. Each line counts the
+/// games it covers, so lines over different game sets are not mistaken for
+/// a like-for-like comparison.
 pub fn render_record(decisions: &[GradedDecision]) -> String {
-    let blended: Vec<Bet> =
-        decisions.iter().filter(|d| d.record.model.is_some()).map(|d| d.main_bet()).collect();
+    let blended: Vec<&GradedDecision> = decisions.iter().filter(|d| d.record.model.is_some()).collect();
+    let mut lines: Vec<(&str, Vec<Bet>)> = Vec::new();
     if blended.is_empty() {
-        return record_line(&decisions.iter().map(|d| d.main_bet()).collect::<Vec<_>>());
+        lines.push(("Kelly", decisions.iter().map(|d| d.main_bet()).collect()));
+        lines.push(("Flat $10", decisions.iter().filter_map(|d| d.flat_bet()).collect()));
+    } else {
+        lines.push(("Blended, Kelly", blended.iter().map(|d| d.main_bet()).collect()));
+        lines.push(("Blended, flat $10", blended.iter().filter_map(|d| d.flat_bet()).collect()));
+        lines.push(("Pace-only, Kelly", decisions.iter().filter_map(|d| d.pace_bet()).collect()));
+        lines.push(("Pace-only, flat $10", decisions.iter().filter_map(|d| d.pace_flat_bet()).collect()));
     }
-    let pace: Vec<Bet> = decisions.iter().filter_map(|d| d.pace_bet()).collect();
-    format!("Blended model:   {}\nPace-only model: {}", record_line(&blended), record_line(&pace))
+    lines.retain(|(_, bets)| !bets.is_empty());
+    let width = lines.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 1;
+    lines
+        .iter()
+        .map(|(name, bets)| format!("{:<width$} {}", format!("{name}:"), record_line(bets)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn record_line(bets: &[Bet]) -> String {
@@ -369,12 +424,15 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("Date        Game"));
         assert!(lines[2].contains("MIL @ NYK") && lines[2].contains("2026-11-10"));
-        assert!(lines[2].contains("OVER $20.00 @ 0.5") && lines[2].ends_with("WON +20.00"));
-        assert!(lines[3].ends_with("pending"));
+        assert!(lines[2].contains("OVER $20.00 @ 0.5") && lines[2].contains("WON +20.00"));
+        // Written before the flat comparison existed.
+        assert!(lines[2].ends_with("n/a"));
+        assert!(lines[3].contains("pending"));
         assert!(lines[4].contains("skip: no edge in either direction"));
+        // No flat line: none of these games has a flat comparison.
         assert!(out.ends_with(
-            "3 games decided, 2 trades, 1 settled (1 won, 0 lost), P&L +20.00 on $20.00 staked, 1 pending"
-        ));
+            "Kelly: 3 games decided, 2 trades, 1 settled (1 won, 0 lost), P&L +20.00 on $20.00 staked, 1 pending"
+        ), "{out}");
     }
 
     #[test]
@@ -383,9 +441,39 @@ mod tests {
         assert!(line.ends_with("P&L +0.00 on $0.00 staked, 1 pending"), "{line}");
     }
 
+    /// `record(traded)` plus a flat $10 comparison taking the same side.
+    fn record_with_flat(traded: bool) -> DecisionRecord {
+        let mut r = record(traded);
+        if traded {
+            r.flat_traded = true;
+            r.flat_side = Some("over".into());
+            r.flat_size_usdc = Some("10".into());
+            r.flat_vwap = Some("0.5".into());
+        } else {
+            r.flat_skip_reason = Some("no edge in either direction".into());
+        }
+        r
+    }
+
+    #[test]
+    fn flat_comparison_is_graded_beside_kelly() {
+        let out = render_paper(&[
+            GradedDecision { record: record_with_flat(true), over_won: Some(true) },
+            GradedDecision { record: record_with_flat(false), over_won: None },
+        ]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("Kelly result") && lines[0].contains("Flat $10"));
+        // $10 at 0.50 buys 20 shares: +$10 if OVER hits.
+        assert!(lines[2].contains("WON +20.00") && lines[2].ends_with("WON +10.00"), "{}", lines[2]);
+        assert!(out.ends_with(
+            "Kelly:    2 games decided, 1 trades, 1 settled (1 won, 0 lost), P&L +20.00 on $20.00 staked, 0 pending\n\
+             Flat $10: 2 games decided, 1 trades, 1 settled (1 won, 0 lost), P&L +10.00 on $10.00 staked, 0 pending"
+        ), "{out}");
+    }
+
     /// A blended-model record whose pace-only comparison bet went the other way.
     fn blended_record() -> DecisionRecord {
-        let mut r = record(true);
+        let mut r = record_with_flat(true);
         r.model = Some("blended".into());
         r.pace_only = Some(crate::paper::ModelDecision {
             projected_total: 190.0,
@@ -397,6 +485,11 @@ mod tests {
             side: Some("under".into()),
             size_usdc: Some("40.00".into()),
             vwap: Some("0.8".into()),
+            flat_traded: true,
+            flat_side: Some("under".into()),
+            flat_size_usdc: Some("10".into()),
+            flat_vwap: Some("0.8".into()),
+            flat_skip_reason: None,
         });
         r
     }
@@ -411,17 +504,18 @@ mod tests {
         let old = GradedDecision { record: record(true), over_won: Some(true) };
         let out = render_paper(&[d, old]);
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[0].contains("Pace-only decision"));
+        assert!(lines[0].contains("Pace-only Kelly") && lines[0].contains("Pace flat $10"));
         assert!(lines[2].contains("WON +20.00") && lines[2].contains("UNDER $40.00 @ 0.8"));
-        assert!(lines[2].ends_with("LOST -40.00"));
+        assert!(lines[2].contains("LOST -40.00") && lines[2].ends_with("LOST -10.00"), "{}", lines[2]);
         assert!(lines[3].ends_with("(same)"));
-        // The pace-only record also counts the older game it decided itself.
-        assert!(out.contains(
-            "Blended model:   1 games decided, 1 trades, 1 settled (1 won, 0 lost), P&L +20.00 on $20.00 staked, 0 pending"
-        ));
+        // The pace-only Kelly line also counts the older game it decided
+        // itself; that game has no flat comparison, so the flat lines skip it.
         assert!(out.ends_with(
-            "Pace-only model: 2 games decided, 2 trades, 2 settled (1 won, 1 lost), P&L -20.00 on $60.00 staked, 0 pending"
-        ));
+            "Blended, Kelly:      1 games decided, 1 trades, 1 settled (1 won, 0 lost), P&L +20.00 on $20.00 staked, 0 pending\n\
+             Blended, flat $10:   1 games decided, 1 trades, 1 settled (1 won, 0 lost), P&L +10.00 on $10.00 staked, 0 pending\n\
+             Pace-only, Kelly:    2 games decided, 2 trades, 2 settled (1 won, 1 lost), P&L -20.00 on $60.00 staked, 0 pending\n\
+             Pace-only, flat $10: 1 games decided, 1 trades, 1 settled (0 won, 1 lost), P&L -10.00 on $10.00 staked, 0 pending"
+        ), "{out}");
     }
 
     #[test]

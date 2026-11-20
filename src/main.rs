@@ -40,6 +40,9 @@ enum Cmd {
         /// Only these SportRadar game ids (comma-separated). Default: all.
         #[arg(long, value_delimiter = ',')]
         games: Vec<String>,
+        /// Stop making SportRadar requests after this many in this run.
+        #[arg(long)]
+        max_requests: Option<u32>,
     },
     /// Download and cache the data the backtest replays.
     BacktestFetch {
@@ -134,8 +137,8 @@ async fn main() -> Result<()> {
             };
             nba_poly_bot::status::run(view).await
         }
-        Cmd::Paper { date, games } => {
-            nba_poly_bot::paper::run(nba_poly_bot::paper::PaperArgs { date, games }).await
+        Cmd::Paper { date, games, max_requests } => {
+            nba_poly_bot::paper::run(nba_poly_bot::paper::PaperArgs { date, games, max_requests }).await
         }
     }
 }

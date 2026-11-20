@@ -45,6 +45,8 @@ pub struct PaperArgs {
     pub date: Option<String>,
     /// Restrict to these SportRadar game ids. Empty = every game that day.
     pub games: Vec<String>,
+    /// Hard cap on SportRadar requests this run (the trial budget is scarce).
+    pub max_requests: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +113,25 @@ pub struct DecisionRecord {
     /// same book. Present only when the blended model made the decision.
     #[serde(default)]
     pub pace_only: Option<ModelDecision>,
+    /// The same decision sized flat (the backtest's `flat_10` variant), so
+    /// paper results compare flat and Kelly on identical games and books.
+    #[serde(default)]
+    pub flat_traded: bool,
+    #[serde(default)]
+    pub flat_side: Option<String>,
+    #[serde(default)]
+    pub flat_size_usdc: Option<String>,
+    #[serde(default)]
+    pub flat_vwap: Option<String>,
+    #[serde(default)]
+    pub flat_skip_reason: Option<String>,
+    /// Real (wall-clock) time of the play that reached the decision point.
+    /// The book is fetched at `decided_at`; a large gap means the price
+    /// already reflects later scoring and the decision is not a fair test.
+    #[serde(default)]
+    pub decision_point_at: Option<Timestamp>,
+    #[serde(default)]
+    pub decision_lag_secs: Option<i64>,
 }
 
 /// A second model's decision on a game, recorded for comparison.
@@ -125,6 +146,17 @@ pub struct ModelDecision {
     pub side: Option<String>,
     pub size_usdc: Option<String>,
     pub vwap: Option<String>,
+    /// The same model's decision sized flat $10.
+    #[serde(default)]
+    pub flat_traded: bool,
+    #[serde(default)]
+    pub flat_side: Option<String>,
+    #[serde(default)]
+    pub flat_size_usdc: Option<String>,
+    #[serde(default)]
+    pub flat_vwap: Option<String>,
+    #[serde(default)]
+    pub flat_skip_reason: Option<String>,
 }
 
 /// Side, stake and price limit of a trade as the record stores them.
@@ -179,11 +211,23 @@ impl DecisionRecord {
             sportradar_requests: 0,
             model: None,
             pace_only: None,
+            flat_traded: false,
+            flat_side: None,
+            flat_size_usdc: None,
+            flat_vwap: None,
+            flat_skip_reason: None,
+            decision_point_at: None,
+            decision_lag_secs: None,
         }
     }
 
     fn skipped(mut self, reason: impl Into<String>) -> Self {
-        self.skip_reason = Some(reason.into());
+        let reason = reason.into();
+        // Skipped before any sizing ran, so flat skips for the same reason.
+        if !self.flat_traded {
+            self.flat_skip_reason = Some(reason.clone());
+        }
+        self.skip_reason = Some(reason);
         self
     }
 
@@ -220,12 +264,19 @@ pub fn decide(
     record.best_ask = book.best_ask().map(|l| l.price.to_string());
 
     let book = Arc::new(book);
+    // Every evaluation below must see the same bootstrap CI, so fix the seed
+    // for this decision if the engine has none.
+    if engine.bootstrap_seed.is_none() {
+        engine.bootstrap_seed = Some(rand::random());
+    }
     // With the blend on, also ask the pure pace model about the same game
     // and book. It needs no extra data, so the comparison costs no requests.
     if let Some(blend) = engine.cfg.blend.take() {
         let pace = engine.evaluate(book.clone());
+        let pace_flat = evaluate_flat(engine, book.clone());
         engine.cfg.blend = Some(blend);
         let (side, size_usdc, vwap) = trade_fields(&pace.intent);
+        let (flat_side, flat_size_usdc, flat_vwap) = trade_fields(&pace_flat.intent);
         record.model = Some("blended".to_string());
         record.pace_only = Some(ModelDecision {
             projected_total: pace.projection.projected_total,
@@ -237,8 +288,18 @@ pub fn decide(
             side,
             size_usdc,
             vwap,
+            flat_traded: pace_flat.intent.is_some(),
+            flat_side,
+            flat_size_usdc,
+            flat_vwap,
+            flat_skip_reason: pace_flat.skip_reason,
         });
     }
+
+    let flat = evaluate_flat(engine, book.clone());
+    record.flat_traded = flat.intent.is_some();
+    (record.flat_side, record.flat_size_usdc, record.flat_vwap) = trade_fields(&flat.intent);
+    record.flat_skip_reason = flat.skip_reason;
 
     let Evaluation { intent, skip_reason, projection, p_over, coverage, q1_margin, lr_p } =
         engine.evaluate(book);
@@ -253,6 +314,26 @@ pub fn decide(
     record.traded = intent.is_some();
     (record.side, record.size_usdc, record.vwap) = trade_fields(&intent);
     record
+}
+
+/// Flat stake used for the paper comparison (matches the backtest's `flat_10`).
+pub const FLAT_STAKE_USDC: f64 = 10.0;
+
+/// Evaluate with flat sizing: an effectively infinite bankroll makes Kelly
+/// exceed the cap whenever there is any edge, so the stake is always
+/// `FLAT_STAKE_USDC` (same trick as the backtest). Restores the sizing.
+fn evaluate_flat(engine: &mut StrategyEngine, book: Arc<OrderBookSnapshot>) -> Evaluation {
+    let kelly = engine.sizing.clone();
+    engine.sizing = SizingParams {
+        bankroll_usdc: 1e12,
+        kelly_fraction: 1.0,
+        ci_ref_width: f64::MAX,
+        min_order_usdc: kelly.min_order_usdc,
+        max_order_usdc: FLAT_STAKE_USDC,
+    };
+    let eval = engine.evaluate(book);
+    engine.sizing = kelly;
+    eval
 }
 
 /// How long to wait before the next play-by-play poll, given the game clock
@@ -276,11 +357,29 @@ pub(crate) struct SportRadar {
     api_key: SecretString,
     next_slot: Mutex<Instant>,
     requests: AtomicU32,
+    max_requests: Option<u32>,
 }
 
 impl SportRadar {
     pub(crate) fn new(http: reqwest::Client, base_url: String, api_key: SecretString) -> Self {
-        Self { http, base_url, api_key, next_slot: Mutex::new(Instant::now()), requests: AtomicU32::new(0) }
+        Self {
+            http,
+            base_url,
+            api_key,
+            next_slot: Mutex::new(Instant::now()),
+            requests: AtomicU32::new(0),
+            max_requests: None,
+        }
+    }
+
+    /// Refuse to send more than `max` requests.
+    pub(crate) fn with_limit(mut self, max: Option<u32>) -> Self {
+        self.max_requests = max;
+        self
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.max_requests.is_some_and(|max| self.requests() >= max)
     }
 
     pub(crate) fn requests(&self) -> u32 {
@@ -292,8 +391,12 @@ impl SportRadar {
             let mut slot = self.next_slot.lock().await;
             sleep_until(*slot).await;
             *slot = Instant::now() + SR_SPACING;
+            // Checked under the lock so concurrent games cannot overshoot.
+            if self.exhausted() {
+                return Err(anyhow!("sportradar request budget exhausted"));
+            }
+            self.requests.fetch_add(1, Ordering::Relaxed);
         }
-        self.requests.fetch_add(1, Ordering::Relaxed);
         let resp = self
             .http
             .get(format!("{}{}", self.base_url, path))
@@ -313,7 +416,9 @@ pub async fn run(args: PaperArgs) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("NPB_SPORTRADAR__API_KEY is not set"))?;
     let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
-    let sr = Arc::new(SportRadar::new(http.clone(), cfg.sportradar.base_url.clone(), api_key));
+    let sr = Arc::new(
+        SportRadar::new(http.clone(), cfg.sportradar.base_url.clone(), api_key).with_limit(args.max_requests),
+    );
 
     let date = match args.date {
         Some(d) => d,
@@ -388,11 +493,12 @@ async fn watch_game(
     let pbp_path = format!("/games/{}/pbp.json", game.id);
     let deadline = game.scheduled + GIVE_UP_AFTER;
 
-    sleep(until(game.scheduled + FIRST_POLL_AFTER)).await;
+    sleep_until_wall(game.scheduled + FIRST_POLL_AFTER).await;
     // (period, clock) at the newest event seen so far, for pacing the next
     // poll. Kept across polls: one that returns nothing new (a timeout, a
     // quiet stretch) must not reset the pacing to "game not started".
     let mut position = (0u8, 720u32);
+    let mut decision_point_at: Option<Timestamp> = None;
     loop {
         if Timestamp::now() > deadline {
             return record.with_engine(&engine).skipped("game did not reach the decision point in time");
@@ -407,14 +513,18 @@ async fn watch_game(
                         position = (*period, *game_clock_seconds);
                     }
                     if matches!(engine.phase, Phase::EdgeEvaluation | Phase::Done) {
+                        decision_point_at = event_time(ev);
                         break;
                     }
                 }
                 info!(game = %label, period = position.0, clock = position.1, new_events = events.len(), "polled");
             }
+            Err(_) if sr.exhausted() => {
+                return record.with_engine(&engine).skipped("sportradar request budget exhausted");
+            }
             Err(e) => {
                 warn!(game = %label, error = ?e, "play-by-play poll failed");
-                sleep(Duration::from_secs(60)).await;
+                sleep_wall(Duration::from_secs(60)).await;
                 continue;
             }
         }
@@ -422,7 +532,7 @@ async fn watch_game(
         match engine.phase {
             Phase::EdgeEvaluation => break,
             Phase::Done => return record.with_engine(&engine).skipped("sample invalidated"),
-            _ => sleep(next_poll_delay(position.0, position.1, cfg.strategy.q2_window_minutes)).await,
+            _ => sleep_wall(next_poll_delay(position.0, position.1, cfg.strategy.q2_window_minutes)).await,
         }
     }
 
@@ -432,15 +542,68 @@ async fn watch_game(
         Err(e) => return record.with_engine(&engine).skipped(format!("market lookup failed: {e}")),
     };
     match fetch_book(http, &market.over_token_id).await {
-        Ok(book) => decide(record, &mut engine, &market, book),
+        Ok(book) => {
+            let mut r = decide(record, &mut engine, &market, book);
+            r.decision_point_at = decision_point_at;
+            r.decision_lag_secs = decision_point_at.map(|t| r.decided_at.duration_since(t).as_secs());
+            if r.decision_lag_secs.is_some_and(|lag| lag > LATE_DECISION_SECS) {
+                warn!(game = %label, lag_secs = ?r.decision_lag_secs, "book fetched well after the decision point");
+            }
+            r
+        }
         Err(e) => {
             record.with_market(&market).with_engine(&engine).skipped(format!("order book unavailable: {e}"))
         }
     }
 }
 
+/// Book fetches later than this after the decision point are flagged.
+pub const LATE_DECISION_SECS: i64 = 180;
+
+/// Longest single timer in `sleep_until_wall`.
+const WALL_CHECK: Duration = Duration::from_secs(15);
+
+fn event_time(ev: &GameEvent) -> Option<Timestamp> {
+    match ev {
+        GameEvent::Tipoff { at }
+        | GameEvent::Score { at, .. }
+        | GameEvent::ClockUpdate { at, .. }
+        | GameEvent::PeriodEnd { at, .. }
+        | GameEvent::RosterChange { at, .. }
+        | GameEvent::FeedGap { at, .. } => Some(*at),
+    }
+}
+
 fn until(t: Timestamp) -> Duration {
-    Duration::try_from(t.duration_since(Timestamp::now())).unwrap_or(Duration::ZERO)
+    let left = t.duration_since(Timestamp::now());
+    // jiff 0.1's `TryFrom<SignedDuration> for Duration` panics (rather than
+    // erroring) on some negative values, so never hand it one.
+    if left.is_negative() || left.is_zero() {
+        return Duration::ZERO;
+    }
+    Duration::try_from(left).unwrap_or(Duration::ZERO)
+}
+
+/// Sleep until wall-clock time `t`.
+///
+/// Tokio timers run on the monotonic clock, which on macOS stops while the
+/// machine sleeps, so one long `sleep` overshoots by however long the
+/// laptop was asleep. Sleeping in short steps and re-reading the wall clock
+/// each time means we wake at most `WALL_CHECK` after `t`, or right after
+/// the machine resumes if it slept through `t`.
+async fn sleep_until_wall(t: Timestamp) {
+    loop {
+        let left = until(t);
+        if left.is_zero() {
+            return;
+        }
+        sleep(left.min(WALL_CHECK)).await;
+    }
+}
+
+async fn sleep_wall(d: Duration) {
+    let d = SignedDuration::try_from(d).unwrap_or(SignedDuration::MAX);
+    sleep_until_wall(Timestamp::now().saturating_add(d)).await;
 }
 
 fn append_record(path: &Path, record: &DecisionRecord) -> Result<()> {
@@ -563,6 +726,10 @@ mod tests {
         assert_eq!(r.best_ask.as_deref(), Some("0.91"));
         assert_eq!(r.q1_per_minute.iter().sum::<u32>(), 57);
         assert!(r.p_over.unwrap() < 0.85);
+        // Flat comparison takes the same side at a fixed $10.
+        assert!(r.flat_traded, "flat_skip_reason: {:?}", r.flat_skip_reason);
+        assert_eq!(r.flat_side.as_deref(), Some("under"));
+        assert_eq!(Decimal::from_str(r.flat_size_usdc.as_deref().unwrap()).unwrap(), Decimal::TEN);
     }
 
     #[test]
@@ -577,6 +744,34 @@ mod tests {
         assert!(!r.traded);
         assert!(r.skip_reason.is_some());
         assert!(r.projected_total.is_some() && r.side.is_none());
+        assert!(!r.flat_traded && r.flat_skip_reason.is_some());
+    }
+
+    #[test]
+    fn skip_before_sizing_applies_to_flat_too() {
+        let r = DecisionRecord::new(&game(), "slug").skipped("no polymarket totals market");
+        assert_eq!(r.flat_skip_reason.as_deref(), Some("no polymarket totals market"));
+    }
+
+    #[tokio::test]
+    async fn wall_sleep_returns_at_once_for_a_past_time() {
+        // A laptop that slept through the wake-up time resumes with the
+        // target already past: the poll must happen right away.
+        let past = Timestamp::now() - SignedDuration::from_mins(5);
+        tokio::time::timeout(Duration::from_millis(200), sleep_until_wall(past)).await.unwrap();
+    }
+
+    #[test]
+    fn until_is_zero_for_any_past_time() {
+        assert_eq!(until(Timestamp::now() - SignedDuration::from_millis(1500)), Duration::ZERO);
+        assert_eq!(until(Timestamp::now() - SignedDuration::from_hours(2)), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn wall_sleep_wakes_at_the_target_time() {
+        let target = Timestamp::now() + SignedDuration::from_millis(300);
+        sleep_until_wall(target).await;
+        assert!(Timestamp::now() >= target);
     }
 
     #[test]
@@ -599,6 +794,9 @@ mod tests {
         assert_eq!(pace.side.as_deref(), Some("under"));
         assert!(pace.projected_total < r.projected_total.unwrap());
         assert!(pace.p_over < r.p_over.unwrap());
+        assert!(pace.flat_traded);
+        assert_eq!(pace.flat_size_usdc.as_deref().map(|s| Decimal::from_str(s).unwrap()), Some(Decimal::TEN));
+        assert!(engine.sizing.max_order_usdc > 10.0, "Kelly sizing must be restored after the flat comparison");
 
         // An old-format line without the new fields still parses.
         let mut json: serde_json::Value = serde_json::to_value(&r).unwrap();
