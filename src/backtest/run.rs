@@ -405,7 +405,7 @@ pub fn render_report(
     );
     let _ = writeln!(
         w,
-        "- **Settings:** min_edge {}, lr_p_threshold {}, max_q1_margin {}, q1_scaling_factor {}, q2_window_minutes {}, ci_ref_width {}, starting bankroll ${}.\n",
+        "- **Settings:** min_edge {}, lr_p_threshold {}, max_q1_margin {}, q1_scaling_factor {}, q2_window_minutes {}, ci_ref_width {}, starting bankroll ${}.",
         cfg.strategy.min_edge,
         cfg.strategy.lr_p_threshold,
         cfg.strategy.max_q1_margin,
@@ -414,6 +414,14 @@ pub fn render_report(
         cfg.sizing.ci_ref_width,
         START_BANKROLL
     );
+    let _ = match &cfg.strategy.blend {
+        Some(b) => writeln!(
+            w,
+            "- **Projection:** pace blended with the line: {} + {} x pace projection + {} x line, sigma {} points.\n",
+            b.intercept, b.pace_weight, b.line_weight, b.sigma
+        ),
+        None => writeln!(w, "- **Projection:** Q1 pace extrapolated, bootstrap interval.\n"),
+    };
 
     let _ = writeln!(w, "## Model accuracy\n");
     let _ = writeln!(w, "| Metric | All games | Passed the gates |\n|---|---|---|");

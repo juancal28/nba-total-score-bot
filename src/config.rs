@@ -55,6 +55,21 @@ pub struct StrategyConfig {
     pub min_edge: f64,
     pub max_q1_margin: i32,
     pub max_book_age_ms: u64,
+    /// Blend the Q1-pace projection with the market line. `None` keeps the
+    /// pure pace extrapolation with its bootstrap interval.
+    #[serde(default)]
+    pub blend: Option<BlendConfig>,
+}
+
+/// Coefficients of `final total = intercept + pace_weight * pace projection
+/// + line_weight * line`, with `sigma` the standard deviation of the final
+/// total around that estimate. Fitted by least squares on backtest games.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
+pub struct BlendConfig {
+    pub intercept: f64,
+    pub pace_weight: f64,
+    pub line_weight: f64,
+    pub sigma: f64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -115,5 +130,7 @@ mod tests {
         let cfg: Config = Figment::new().merge(Toml::file("config/default.toml")).extract().unwrap();
         assert_eq!(cfg.sizing.kelly_fraction, 0.25);
         assert_eq!(cfg.sizing.bankroll_usdc, Decimal::from(500));
+        let blend = cfg.strategy.blend.expect("default config enables the blend");
+        assert!(blend.sigma > 0.0);
     }
 }

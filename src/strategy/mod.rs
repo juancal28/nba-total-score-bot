@@ -226,17 +226,21 @@ impl StrategyEngine {
             0.05,
             &mut rng,
         );
-        let projection = Projection::build(
+        let line_f = self.line.to_string().parse::<f64>().unwrap_or(0.0);
+        let pace = Projection::build(
             &q1_fit,
             current_score,
             remaining,
             self.cfg.q1_scaling_factor,
             (lo, hi),
         );
+        let projection = match &self.cfg.blend {
+            Some(blend) => Projection::blended(current_score, pace.projected_total, line_f, blend),
+            None => pace,
+        };
         info!(?projection, line = %self.line, "projection built");
 
         // Edge eval against book.
-        let line_f = self.line.to_string().parse::<f64>().unwrap_or(0.0);
         let p_over = projection.p_over(line_f);
 
         let mut intent = None;
@@ -287,6 +291,7 @@ mod tests {
             min_edge: 0.05,
             max_q1_margin: 12,
             max_book_age_ms: 500,
+            blend: None,
         };
         let sizing = SizingParams {
             bankroll_usdc: 500.0,
@@ -355,5 +360,35 @@ mod tests {
         assert!(eval.skip_reason.unwrap().contains("blowout"));
         assert_eq!(eval.q1_margin, 36);
         assert!(eval.projection.projected_total > 36.0);
+    }
+
+    #[test]
+    fn blend_pulls_a_slow_start_toward_the_line() {
+        // 2 points a minute for 14 minutes: pace alone projects
+        // 28 + 2 * 0.97 * 34 = 93.96 against a line of 224.5.
+        let run = |blend| {
+            let mut e = engine();
+            e.cfg.blend = blend;
+            let mut events: Vec<GameEvent> = (0..12u32)
+                .map(|m| score(1, 720 - m * 60 - 30, if m % 2 == 0 { Team::Home } else { Team::Away }, 2))
+                .collect();
+            events.push(GameEvent::PeriodEnd { at: Timestamp::UNIX_EPOCH, period: 1 });
+            events.push(score(2, 700, Team::Home, 2));
+            events.push(score(2, 650, Team::Away, 2));
+            events.push(GameEvent::ClockUpdate { at: Timestamp::UNIX_EPOCH, period: 2, game_clock_seconds: 590 });
+            drive(&mut e, &events);
+            e.evaluate(Arc::new(OrderBookSnapshot::empty("over".into())))
+        };
+
+        let pace_only = run(None);
+        assert!((pace_only.projection.projected_total - 93.96).abs() < 1e-6);
+
+        let blend =
+            crate::config::BlendConfig { intercept: 27.5, pace_weight: 0.286, line_weight: 0.597, sigma: 16.6 };
+        let blended = run(Some(blend));
+        let expected = 27.5 + 0.286 * 93.96 + 0.597 * 224.5;
+        assert!((blended.projection.projected_total - expected).abs() < 1e-6);
+        assert!((blended.projection.ci_high - blended.projection.ci_low - 2.0 * 1.96 * 16.6).abs() < 1e-6);
+        assert!(blended.p_over > pace_only.p_over);
     }
 }

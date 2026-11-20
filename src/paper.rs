@@ -28,7 +28,7 @@ use crate::feed::sportradar::{PbpCursor, parse_pbp};
 use crate::polymarket::book::OrderBookSnapshot;
 use crate::polymarket::public::{TotalsMarket, event_slug, fetch_book, fetch_main_totals_market};
 use crate::strategy::sizing::SizingParams;
-use crate::strategy::{BuyOutcome, Evaluation, Phase, StrategyEngine};
+use crate::strategy::{BuyOutcome, Evaluation, Phase, StrategyEngine, TradeIntent};
 
 pub const DECISIONS_PATH: &str = "data/paper/decisions.jsonl";
 /// Minimum spacing between SportRadar requests (trial limit is 1 per second).
@@ -103,6 +103,46 @@ pub struct DecisionRecord {
     pub q1_per_minute: Vec<u32>,
     pub q2_per_minute: Vec<u32>,
     pub sportradar_requests: u32,
+    /// Which projection made the decision above: `"blended"`, or `None` for
+    /// the pure pace extrapolation (every record before the blend existed).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// What the pure pace model would have done with the same game and the
+    /// same book. Present only when the blended model made the decision.
+    #[serde(default)]
+    pub pace_only: Option<ModelDecision>,
+}
+
+/// A second model's decision on a game, recorded for comparison.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelDecision {
+    pub projected_total: f64,
+    pub ci_low: f64,
+    pub ci_high: f64,
+    pub p_over: f64,
+    pub traded: bool,
+    pub skip_reason: Option<String>,
+    pub side: Option<String>,
+    pub size_usdc: Option<String>,
+    pub vwap: Option<String>,
+}
+
+/// Side, stake and price limit of a trade as the record stores them.
+fn trade_fields(intent: &Option<TradeIntent>) -> (Option<String>, Option<String>, Option<String>) {
+    match intent {
+        Some(t) => (
+            Some(
+                match t.buy_side {
+                    BuyOutcome::Over => "over",
+                    BuyOutcome::Under => "under",
+                }
+                .to_string(),
+            ),
+            Some(t.size_usdc.to_string()),
+            Some(t.max_vwap.to_string()),
+        ),
+        None => (None, None, None),
+    }
 }
 
 impl DecisionRecord {
@@ -137,6 +177,8 @@ impl DecisionRecord {
             q1_per_minute: vec![],
             q2_per_minute: vec![],
             sportradar_requests: 0,
+            model: None,
+            pace_only: None,
         }
     }
 
@@ -177,8 +219,29 @@ pub fn decide(
     record.best_bid = book.best_bid().map(|l| l.price.to_string());
     record.best_ask = book.best_ask().map(|l| l.price.to_string());
 
+    let book = Arc::new(book);
+    // With the blend on, also ask the pure pace model about the same game
+    // and book. It needs no extra data, so the comparison costs no requests.
+    if let Some(blend) = engine.cfg.blend.take() {
+        let pace = engine.evaluate(book.clone());
+        engine.cfg.blend = Some(blend);
+        let (side, size_usdc, vwap) = trade_fields(&pace.intent);
+        record.model = Some("blended".to_string());
+        record.pace_only = Some(ModelDecision {
+            projected_total: pace.projection.projected_total,
+            ci_low: pace.projection.ci_low,
+            ci_high: pace.projection.ci_high,
+            p_over: pace.p_over,
+            traded: pace.intent.is_some(),
+            skip_reason: pace.skip_reason,
+            side,
+            size_usdc,
+            vwap,
+        });
+    }
+
     let Evaluation { intent, skip_reason, projection, p_over, coverage, q1_margin, lr_p } =
-        engine.evaluate(Arc::new(book));
+        engine.evaluate(book);
     record.projected_total = Some(projection.projected_total);
     record.ci_low = Some(projection.ci_low);
     record.ci_high = Some(projection.ci_high);
@@ -187,18 +250,8 @@ pub fn decide(
     record.q1_margin = Some(q1_margin);
     record.lr_p = Some(lr_p);
     record.skip_reason = skip_reason;
-    if let Some(intent) = intent {
-        record.traded = true;
-        record.side = Some(
-            match intent.buy_side {
-                BuyOutcome::Over => "over",
-                BuyOutcome::Under => "under",
-            }
-            .to_string(),
-        );
-        record.size_usdc = Some(intent.size_usdc.to_string());
-        record.vwap = Some(intent.max_vwap.to_string());
-    }
+    record.traded = intent.is_some();
+    (record.side, record.size_usdc, record.vwap) = trade_fields(&intent);
     record
 }
 
@@ -442,6 +495,7 @@ mod tests {
             min_edge: 0.05,
             max_q1_margin: 12,
             max_book_age_ms: 500,
+            blend: None,
         };
         let sizing = SizingParams {
             bankroll_usdc: 500.0,
@@ -523,6 +577,42 @@ mod tests {
         assert!(!r.traded);
         assert!(r.skip_reason.is_some());
         assert!(r.projected_total.is_some() && r.side.is_none());
+    }
+
+    #[test]
+    fn blended_decision_also_records_what_the_pace_model_would_do() {
+        // Same game and book as the cheap-under test. Pace alone projects far
+        // under the line; the blend sits closer to it and so is less sure.
+        let mut engine = engine_at_decision();
+        engine.cfg.blend = Some(crate::config::BlendConfig {
+            intercept: 27.5,
+            pace_weight: 0.286,
+            line_weight: 0.597,
+            sigma: 16.6,
+        });
+        let r = decide(DecisionRecord::new(&game(), "slug"), &mut engine, &market(), book("0.90", "0.91"));
+        assert_eq!(r.model.as_deref(), Some("blended"));
+        assert!(engine.cfg.blend.is_some(), "blend must be restored after the comparison");
+
+        let pace = r.pace_only.clone().expect("pace-only comparison recorded");
+        assert!(pace.traded);
+        assert_eq!(pace.side.as_deref(), Some("under"));
+        assert!(pace.projected_total < r.projected_total.unwrap());
+        assert!(pace.p_over < r.p_over.unwrap());
+
+        // An old-format line without the new fields still parses.
+        let mut json: serde_json::Value = serde_json::to_value(&r).unwrap();
+        json.as_object_mut().unwrap().remove("model");
+        json.as_object_mut().unwrap().remove("pace_only");
+        let old: DecisionRecord = serde_json::from_value(json).unwrap();
+        assert!(old.model.is_none() && old.pace_only.is_none());
+    }
+
+    #[test]
+    fn pace_only_decision_records_no_comparison() {
+        let mut engine = engine_at_decision();
+        let r = decide(DecisionRecord::new(&game(), "slug"), &mut engine, &market(), book("0.90", "0.91"));
+        assert!(r.model.is_none() && r.pace_only.is_none());
     }
 
     #[test]

@@ -33,6 +33,18 @@ min_edge = 0.05
 max_q1_margin = 12
 max_book_age_ms = 500
 
+# Blend of the Q1-pace projection with the market line:
+#   final total = intercept + pace_weight * pace projection + line_weight * line
+# `sigma` is the standard deviation (points) of final totals around that
+# estimate. Least-squares fit on 638 games (2025-10-21 to 2026-11-09) with
+# q1_scaling_factor 0.97; refit if that factor changes. Delete this table to
+# go back to the pure pace extrapolation.
+[strategy.blend]
+intercept = 27.5
+pace_weight = 0.286
+line_weight = 0.597
+sigma = 16.6
+
 [execution]
 max_slippage = "0.02"
 sign_max_book_age_ms = 250

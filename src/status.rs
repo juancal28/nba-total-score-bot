@@ -30,17 +30,54 @@ pub struct GradedDecision {
     pub over_won: Option<bool>,
 }
 
+/// Profit or loss in USDC of a recorded bet once its market has settled.
+fn bet_pnl(side: Option<&str>, size: Option<&str>, vwap: Option<&str>, over_won: Option<bool>) -> Option<f64> {
+    let side = match side? {
+        "over" => BuyOutcome::Over,
+        _ => BuyOutcome::Under,
+    };
+    let stake: f64 = size?.parse().ok()?;
+    let vwap: f64 = vwap?.parse().ok()?;
+    Some(pnl(side, stake, vwap, over_won?))
+}
+
+/// One model's bet on one game, reduced to what the running record needs.
+struct Bet {
+    traded: bool,
+    stake: Option<f64>,
+    pnl: Option<f64>,
+}
+
 impl GradedDecision {
     /// Profit or loss in USDC for a settled trade.
     pub fn pnl(&self) -> Option<f64> {
         let r = &self.record;
-        let side = match r.side.as_deref()? {
-            "over" => BuyOutcome::Over,
-            _ => BuyOutcome::Under,
-        };
-        let stake: f64 = r.size_usdc.as_deref()?.parse().ok()?;
-        let vwap: f64 = r.vwap.as_deref()?.parse().ok()?;
-        Some(pnl(side, stake, vwap, self.over_won?))
+        bet_pnl(r.side.as_deref(), r.size_usdc.as_deref(), r.vwap.as_deref(), self.over_won)
+    }
+
+    /// Profit or loss of the pace-only comparison bet, when one was recorded.
+    pub fn pace_only_pnl(&self) -> Option<f64> {
+        let p = self.record.pace_only.as_ref()?;
+        bet_pnl(p.side.as_deref(), p.size_usdc.as_deref(), p.vwap.as_deref(), self.over_won)
+    }
+
+    fn main_bet(&self) -> Bet {
+        let r = &self.record;
+        Bet { traded: r.traded, stake: r.size_usdc.as_deref().and_then(|s| s.parse().ok()), pnl: self.pnl() }
+    }
+
+    /// The pure pace model's bet: the comparison bet on a blended record, or
+    /// the decision itself on a record from before the blend existed.
+    fn pace_bet(&self) -> Option<Bet> {
+        match (&self.record.pace_only, &self.record.model) {
+            (Some(p), _) => Some(Bet {
+                traded: p.traded,
+                stake: p.size_usdc.as_deref().and_then(|s| s.parse().ok()),
+                pnl: self.pace_only_pnl(),
+            }),
+            (None, None) => Some(self.main_bet()),
+            (None, Some(_)) => None,
+        }
     }
 }
 
@@ -62,7 +99,8 @@ async fn grade(records: Vec<DecisionRecord>) -> Vec<GradedDecision> {
     let mut out = Vec::with_capacity(records.len());
     for record in records {
         let mut over_won = None;
-        if let (true, Some(token)) = (record.traded, record.over_token_id.as_deref()) {
+        let any_trade = record.traded || record.pace_only.as_ref().is_some_and(|p| p.traded);
+        if let (true, Some(token)) = (any_trade, record.over_token_id.as_deref()) {
             if !events.contains_key(&record.slug) {
                 if let Ok(body) = fetch_event_raw(&http, &record.slug).await {
                     events.insert(record.slug.clone(), body);
@@ -111,21 +149,27 @@ pub fn render_paper(decisions: &[GradedDecision]) -> String {
     if decisions.is_empty() {
         return "No paper decisions recorded for this selection.".to_string();
     }
+    let describe = |traded: bool, side: &Option<String>, size: &Option<String>, vwap: &Option<String>, skip: &Option<String>| {
+        if traded {
+            format!("{} ${} @ {}", opt(side).to_uppercase(), opt(size), opt(vwap))
+        } else {
+            format!("skip: {}", opt(skip))
+        }
+    };
+    let outcome = |traded: bool, over_won: Option<bool>, pnl: Option<f64>| match (traded, over_won, pnl) {
+        (false, _, _) => "-".to_string(),
+        (true, Some(_), Some(p)) => format!("{} {:+.2}", if p > 0.0 { "WON" } else { "LOST" }, p),
+        (true, _, _) => "pending".to_string(),
+    };
+    // The comparison columns appear only when some game has a comparison.
+    let compare = decisions.iter().any(|d| d.record.pace_only.is_some());
     let rows: Vec<Vec<String>> = decisions
         .iter()
         .map(|d| {
             let r = &d.record;
-            let decision = if r.traded {
-                format!("{} ${} @ {}", opt(&r.side).to_uppercase(), opt(&r.size_usdc), opt(&r.vwap))
-            } else {
-                format!("skip: {}", opt(&r.skip_reason))
-            };
-            let result = match (r.traded, d.over_won, d.pnl()) {
-                (false, _, _) => "-".to_string(),
-                (true, Some(_), Some(p)) => format!("{} {:+.2}", if p > 0.0 { "WON" } else { "LOST" }, p),
-                (true, _, _) => "pending".to_string(),
-            };
-            vec![
+            let decision = describe(r.traded, &r.side, &r.size_usdc, &r.vwap, &r.skip_reason);
+            let result = outcome(r.traded, d.over_won, d.pnl());
+            let mut row = vec![
                 eastern_date(r.scheduled),
                 format!("{} @ {}", r.away, r.home),
                 opt(&r.line),
@@ -134,30 +178,52 @@ pub fn render_paper(decisions: &[GradedDecision]) -> String {
                 format!("{} / {}", opt(&r.best_bid), opt(&r.best_ask)),
                 decision,
                 result,
-            ]
+            ];
+            if compare {
+                match &r.pace_only {
+                    Some(p) => row.extend([
+                        format!("{:.1}", p.projected_total),
+                        format!("{:.2}", p.p_over),
+                        describe(p.traded, &p.side, &p.size_usdc, &p.vwap, &p.skip_reason),
+                        outcome(p.traded, d.over_won, d.pace_only_pnl()),
+                    ]),
+                    // A record from before the blend: the decision was pace-only.
+                    None => row.extend(["(same)", "(same)", "(same)", "(same)"].map(String::from)),
+                }
+            }
+            row
         })
         .collect();
-    let mut out = table(
-        &["Date", "Game", "Line", "Projection", "P(over)", "Bid / Ask", "Decision", "Result"],
-        &rows,
-    );
+    let mut headers = vec!["Date", "Game", "Line", "Projection", "P(over)", "Bid / Ask", "Decision", "Result"];
+    if compare {
+        headers.extend(["Pace proj.", "Pace P(over)", "Pace-only decision", "Pace-only result"]);
+    }
+    let mut out = table(&headers, &rows);
     let _ = write!(out, "\n\n{}", render_record(decisions));
     out
 }
 
-/// One-line running record over the given decisions.
+/// Running record over the given decisions. One line while only one model
+/// has decided games; one line per model once the blended model has records,
+/// so the two can be compared on the games each of them saw.
 pub fn render_record(decisions: &[GradedDecision]) -> String {
-    let trades = decisions.iter().filter(|d| d.record.traded).count();
-    let settled: Vec<f64> = decisions.iter().filter_map(|d| d.pnl()).collect();
+    let blended: Vec<Bet> =
+        decisions.iter().filter(|d| d.record.model.is_some()).map(|d| d.main_bet()).collect();
+    if blended.is_empty() {
+        return record_line(&decisions.iter().map(|d| d.main_bet()).collect::<Vec<_>>());
+    }
+    let pace: Vec<Bet> = decisions.iter().filter_map(|d| d.pace_bet()).collect();
+    format!("Blended model:   {}\nPace-only model: {}", record_line(&blended), record_line(&pace))
+}
+
+fn record_line(bets: &[Bet]) -> String {
+    let trades = bets.iter().filter(|b| b.traded).count();
+    let settled: Vec<f64> = bets.iter().filter_map(|b| b.pnl).collect();
     let wins = settled.iter().filter(|p| **p > 0.0).count();
-    let staked: f64 = decisions
-        .iter()
-        .filter(|d| d.pnl().is_some())
-        .filter_map(|d| d.record.size_usdc.as_deref()?.parse::<f64>().ok())
-        .sum();
+    let staked: f64 = bets.iter().filter(|b| b.pnl.is_some()).filter_map(|b| b.stake).sum();
     format!(
         "{} games decided, {} trades, {} settled ({} won, {} lost), P&L {:+.2} on ${:.2} staked, {} pending",
-        decisions.len(),
+        bets.len(),
         trades,
         settled.len(),
         wins,
@@ -236,7 +302,7 @@ pub async fn run(view: StatusView) -> Result<()> {
                 all.iter().filter(|d| eastern_date(d.record.scheduled) == today).cloned().collect();
             println!("Paper trading, {today}\n");
             println!("{}", render_paper(&tonight));
-            println!("\nAll paper trading to date: {}", render_record(&all));
+            println!("\nAll paper trading to date:\n{}", render_record(&all));
             match list_reports(root).last() {
                 Some(dir) => {
                     let report = read_report(dir)?;
@@ -315,6 +381,47 @@ mod tests {
     fn record_with_nothing_settled_shows_plain_zeros() {
         let line = render_record(&[GradedDecision { record: record(true), over_won: None }]);
         assert!(line.ends_with("P&L +0.00 on $0.00 staked, 1 pending"), "{line}");
+    }
+
+    /// A blended-model record whose pace-only comparison bet went the other way.
+    fn blended_record() -> DecisionRecord {
+        let mut r = record(true);
+        r.model = Some("blended".into());
+        r.pace_only = Some(crate::paper::ModelDecision {
+            projected_total: 190.0,
+            ci_low: 150.0,
+            ci_high: 230.0,
+            p_over: 0.06,
+            traded: true,
+            skip_reason: None,
+            side: Some("under".into()),
+            size_usdc: Some("40.00".into()),
+            vwap: Some("0.8".into()),
+        });
+        r
+    }
+
+    #[test]
+    fn comparison_bet_is_graded_and_shown_beside_the_decision() {
+        // OVER hit: the blended OVER wins $20, the pace-only UNDER loses its $40.
+        let d = GradedDecision { record: blended_record(), over_won: Some(true) };
+        assert_eq!(d.pnl(), Some(20.0));
+        assert_eq!(d.pace_only_pnl(), Some(-40.0));
+
+        let old = GradedDecision { record: record(true), over_won: Some(true) };
+        let out = render_paper(&[d, old]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("Pace-only decision"));
+        assert!(lines[2].contains("WON +20.00") && lines[2].contains("UNDER $40.00 @ 0.8"));
+        assert!(lines[2].ends_with("LOST -40.00"));
+        assert!(lines[3].ends_with("(same)"));
+        // The pace-only record also counts the older game it decided itself.
+        assert!(out.contains(
+            "Blended model:   1 games decided, 1 trades, 1 settled (1 won, 0 lost), P&L +20.00 on $20.00 staked, 0 pending"
+        ));
+        assert!(out.ends_with(
+            "Pace-only model: 2 games decided, 2 trades, 2 settled (1 won, 1 lost), P&L -20.00 on $60.00 staked, 0 pending"
+        ));
     }
 
     #[test]
