@@ -102,6 +102,13 @@ impl GradedDecision {
         })
     }
 
+    /// `bet` as the running record should count it: a trade decided on a book
+    /// fetched too late after the decision point (older records, written
+    /// before paper mode voided such trades itself) counts as no trade.
+    fn counted(&self, bet: Bet) -> Bet {
+        if self.record.is_late() { Bet { traded: false, stake: None, pnl: None } } else { bet }
+    }
+
     /// The pure pace model sized flat $10; same fallbacks as `pace_bet`.
     fn pace_flat_bet(&self) -> Option<Bet> {
         match (&self.record.pace_only, &self.record.model) {
@@ -203,6 +210,10 @@ pub fn render_paper(decisions: &[GradedDecision]) -> String {
         .map(|d| {
             let r = &d.record;
             let decision = describe(r.traded, &r.side, &r.size_usdc, &r.vwap, &r.skip_reason);
+            // Late trades in older records are shown but not counted.
+            let outcome = |traded: bool, over_won: Option<bool>, pnl: Option<f64>| {
+                if traded && r.is_late() { "late, void".to_string() } else { outcome(traded, over_won, pnl) }
+            };
             let result = outcome(r.traded, d.over_won, d.pnl());
             let flat = |b: Option<Bet>| match b {
                 Some(b) => outcome(b.traded, d.over_won, b.pnl),
@@ -254,13 +265,16 @@ pub fn render_record(decisions: &[GradedDecision]) -> String {
     let blended: Vec<&GradedDecision> = decisions.iter().filter(|d| d.record.model.is_some()).collect();
     let mut lines: Vec<(&str, Vec<Bet>)> = Vec::new();
     if blended.is_empty() {
-        lines.push(("Kelly", decisions.iter().map(|d| d.main_bet()).collect()));
-        lines.push(("Flat $10", decisions.iter().filter_map(|d| d.flat_bet()).collect()));
+        lines.push(("Kelly", decisions.iter().map(|d| d.counted(d.main_bet())).collect()));
+        lines.push(("Flat $10", decisions.iter().filter_map(|d| Some(d.counted(d.flat_bet()?))).collect()));
     } else {
-        lines.push(("Blended, Kelly", blended.iter().map(|d| d.main_bet()).collect()));
-        lines.push(("Blended, flat $10", blended.iter().filter_map(|d| d.flat_bet()).collect()));
-        lines.push(("Pace-only, Kelly", decisions.iter().filter_map(|d| d.pace_bet()).collect()));
-        lines.push(("Pace-only, flat $10", decisions.iter().filter_map(|d| d.pace_flat_bet()).collect()));
+        lines.push(("Blended, Kelly", blended.iter().map(|d| d.counted(d.main_bet())).collect()));
+        lines.push(("Blended, flat $10", blended.iter().filter_map(|d| Some(d.counted(d.flat_bet()?))).collect()));
+        lines.push(("Pace-only, Kelly", decisions.iter().filter_map(|d| Some(d.counted(d.pace_bet()?))).collect()));
+        lines.push((
+            "Pace-only, flat $10",
+            decisions.iter().filter_map(|d| Some(d.counted(d.pace_flat_bet()?))).collect(),
+        ));
     }
     lines.retain(|(_, bets)| !bets.is_empty());
     let width = lines.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 1;
@@ -515,6 +529,23 @@ mod tests {
              Blended, flat $10:   1 games decided, 1 trades, 1 settled (1 won, 0 lost), P&L +10.00 on $10.00 staked, 0 pending\n\
              Pace-only, Kelly:    2 games decided, 2 trades, 2 settled (1 won, 1 lost), P&L -20.00 on $60.00 staked, 0 pending\n\
              Pace-only, flat $10: 1 games decided, 1 trades, 1 settled (0 won, 1 lost), P&L -10.00 on $10.00 staked, 0 pending"
+        ), "{out}");
+    }
+
+    #[test]
+    fn late_trades_in_older_records_are_shown_but_not_counted() {
+        let mut late = record_with_flat(true);
+        late.decision_lag_secs = Some(crate::paper::LATE_DECISION_SECS + 144);
+        let out = render_paper(&[
+            GradedDecision { record: late, over_won: Some(true) },
+            GradedDecision { record: record_with_flat(true), over_won: Some(true) },
+        ]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[2].contains("OVER $20.00 @ 0.5") && lines[2].matches("late, void").count() == 2, "{}", lines[2]);
+        assert!(lines[3].ends_with("WON +10.00"));
+        assert!(out.ends_with(
+            "Kelly:    2 games decided, 1 trades, 1 settled (1 won, 0 lost), P&L +20.00 on $20.00 staked, 0 pending\n\
+             Flat $10: 2 games decided, 1 trades, 1 settled (1 won, 0 lost), P&L +10.00 on $10.00 staked, 0 pending"
         ), "{out}");
     }
 

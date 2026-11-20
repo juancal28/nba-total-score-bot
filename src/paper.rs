@@ -241,6 +241,39 @@ impl DecisionRecord {
         self
     }
 
+    /// Whether the book was fetched too long after the decision point for
+    /// the trade to be a fair test (see `LATE_DECISION_SECS`).
+    pub fn is_late(&self) -> bool {
+        self.decision_lag_secs.is_some_and(|lag| lag > LATE_DECISION_SECS)
+    }
+
+    /// Stamp when the decision point was reached and, if the book came too
+    /// late after it (bot started mid-game, or the machine slept), void every
+    /// trade. Model outputs and prices are kept: the projection is still a
+    /// valid data point for model accuracy, only the P&L would be unfair.
+    fn at_decision_point(mut self, at: Option<Timestamp>) -> Self {
+        self.decision_point_at = at;
+        self.decision_lag_secs = at.map(|t| self.decided_at.duration_since(t).as_secs());
+        if !self.is_late() {
+            return self;
+        }
+        let reason = format!(
+            "late: book fetched {} s after the decision point (limit {LATE_DECISION_SECS} s)",
+            self.decision_lag_secs.unwrap_or_default()
+        );
+        (self.traded, self.side, self.size_usdc, self.vwap) = (false, None, None, None);
+        self.skip_reason = Some(reason.clone());
+        (self.flat_traded, self.flat_side, self.flat_size_usdc, self.flat_vwap) = (false, None, None, None);
+        self.flat_skip_reason = Some(reason.clone());
+        if let Some(p) = self.pace_only.as_mut() {
+            (p.traded, p.side, p.size_usdc, p.vwap) = (false, None, None, None);
+            p.skip_reason = Some(reason.clone());
+            (p.flat_traded, p.flat_side, p.flat_size_usdc, p.flat_vwap) = (false, None, None, None);
+            p.flat_skip_reason = Some(reason);
+        }
+        self
+    }
+
     fn with_engine(mut self, engine: &StrategyEngine) -> Self {
         self.q1_per_minute = engine.q1_per_minute.clone();
         self.q2_per_minute = engine.q2_per_minute.clone();
@@ -543,11 +576,9 @@ async fn watch_game(
     };
     match fetch_book(http, &market.over_token_id).await {
         Ok(book) => {
-            let mut r = decide(record, &mut engine, &market, book);
-            r.decision_point_at = decision_point_at;
-            r.decision_lag_secs = decision_point_at.map(|t| r.decided_at.duration_since(t).as_secs());
-            if r.decision_lag_secs.is_some_and(|lag| lag > LATE_DECISION_SECS) {
-                warn!(game = %label, lag_secs = ?r.decision_lag_secs, "book fetched well after the decision point");
+            let r = decide(record, &mut engine, &market, book).at_decision_point(decision_point_at);
+            if r.is_late() {
+                warn!(game = %label, lag_secs = ?r.decision_lag_secs, "book fetched too late; trades voided");
             }
             r
         }
@@ -557,7 +588,8 @@ async fn watch_game(
     }
 }
 
-/// Book fetches later than this after the decision point are flagged.
+/// A book fetched later than this after the decision point already prices in
+/// scoring the model never saw, so trades decided on it are voided.
 pub const LATE_DECISION_SECS: i64 = 180;
 
 /// Longest single timer in `sleep_until_wall`.
@@ -745,6 +777,46 @@ mod tests {
         assert!(r.skip_reason.is_some());
         assert!(r.projected_total.is_some() && r.side.is_none());
         assert!(!r.flat_traded && r.flat_skip_reason.is_some());
+    }
+
+    /// A blended decision with trades for every model and sizing.
+    fn traded_blended_record() -> DecisionRecord {
+        let mut engine = engine_at_decision();
+        engine.cfg.blend = Some(crate::config::BlendConfig {
+            intercept: 27.5,
+            pace_weight: 0.286,
+            line_weight: 0.597,
+            sigma: 16.6,
+        });
+        let r = decide(DecisionRecord::new(&game(), "slug"), &mut engine, &market(), book("0.90", "0.91"));
+        assert!(r.pace_only.as_ref().unwrap().traded && r.pace_only.as_ref().unwrap().flat_traded);
+        r
+    }
+
+    #[test]
+    fn late_book_voids_every_trade_but_keeps_the_model_outputs() {
+        let r = traded_blended_record();
+        let (projection, p_over) = (r.projected_total, r.p_over);
+        let late = r.decided_at - SignedDuration::from_secs(LATE_DECISION_SECS + 1);
+        let r = r.at_decision_point(Some(late));
+        assert!(r.is_late());
+        assert_eq!(r.decision_lag_secs, Some(LATE_DECISION_SECS + 1));
+        assert!(!r.traded && r.side.is_none() && r.size_usdc.is_none());
+        assert!(r.skip_reason.as_deref().unwrap().starts_with("late:"));
+        assert!(!r.flat_traded && r.flat_skip_reason.as_deref().unwrap().starts_with("late:"));
+        let p = r.pace_only.as_ref().unwrap();
+        assert!(!p.traded && !p.flat_traded && p.skip_reason.as_deref().unwrap().starts_with("late:"));
+        assert_eq!((r.projected_total, r.p_over), (projection, p_over));
+        assert!(r.best_ask.is_some());
+    }
+
+    #[test]
+    fn prompt_book_keeps_the_trades() {
+        let r = traded_blended_record();
+        let on_time = r.decided_at - SignedDuration::from_secs(LATE_DECISION_SECS);
+        let r = r.at_decision_point(Some(on_time));
+        assert!(!r.is_late());
+        assert!(r.traded && r.flat_traded && r.pace_only.as_ref().unwrap().traded);
     }
 
     #[test]
